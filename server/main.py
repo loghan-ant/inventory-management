@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import date, timedelta
+import uuid
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -119,6 +121,118 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+
+# Task fields use camelCase (dueDate) to match the existing frontend contract
+# (TasksModal / api.js), which is what the UI reads and writes directly.
+class Task(BaseModel):
+    id: str
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str = "medium"
+    dueDate: str
+
+# In-memory store for user-created tasks. Non-persistent (lost on restart),
+# matching the rest of the app. The UI merges these with the mock user's tasks.
+user_tasks: list = []
+
+
+# --- Restocking ---------------------------------------------------------------
+
+# Only 1/9 demand-forecast SKUs exist in inventory.json, so we keep a fallback
+# cost+category map here for the rest. Inventory is checked first; this fills
+# gaps so the budget math and lead-time lookup always work.
+RESTOCK_ITEM_FALLBACK = {
+    "WDG-001": {"unit_cost": 18.50, "category": "Actuators"},
+    "BRG-102": {"unit_cost": 42.00, "category": "Actuators"},
+    "GSK-203": {"unit_cost": 6.25,  "category": "Actuators"},
+    "MTR-304": {"unit_cost": 145.00, "category": "Actuators"},
+    "CTL-330": {"unit_cost": 89.99, "category": "Controllers"},
+    "FLT-405": {"unit_cost": 22.40, "category": "Sensors"},
+    "SNR-420": {"unit_cost": 34.75, "category": "Sensors"},
+    "PSU-501": {"unit_cost": 67.50, "category": "Power Supplies"},
+    "VLV-506": {"unit_cost": 58.00, "category": "Actuators"},
+}
+
+# Fixed per-category lead times (days). Chosen as realistic demo values; the
+# Restocking tab surfaces these as "delivery lead time" on submitted orders.
+CATEGORY_LEAD_TIME_DAYS = {
+    "Circuit Boards": 14,
+    "Controllers": 10,
+    "Power Supplies": 12,
+    "Sensors": 7,
+    "Actuators": 5,
+}
+DEFAULT_LEAD_TIME_DAYS = 10
+
+# In-memory store for submitted restock orders. Intentionally non-persistent —
+# matches the rest of the app (lost on restart).
+submitted_restock_orders: list = []
+
+
+def _lookup_item_cost_category(sku: str) -> dict:
+    """Resolve unit_cost + category for a SKU.
+
+    Inventory is the source of truth; RESTOCK_ITEM_FALLBACK covers demand-forecast
+    SKUs that don't appear there. Returns a default if both miss so the endpoint
+    never 500s on unknown SKUs.
+    """
+    inv = next((i for i in inventory_items if i["sku"] == sku), None)
+    if inv:
+        return {"unit_cost": inv["unit_cost"], "category": inv["category"]}
+    if sku in RESTOCK_ITEM_FALLBACK:
+        return RESTOCK_ITEM_FALLBACK[sku]
+    return {"unit_cost": 50.0, "category": "Uncategorized"}
+
+
+class RestockRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    demand_gap: int
+    recommended_quantity: int
+    unit_cost: float
+    line_cost: float
+    lead_time_days: int
+    included: bool  # True if this line fits within the requested budget
+
+
+class RestockRecommendationsResponse(BaseModel):
+    budget: float
+    total_cost: float
+    remaining_budget: float
+    items: List[RestockRecommendation]
+
+
+class RestockLineItem(BaseModel):
+    item_sku: str
+    item_name: str
+    category: str
+    quantity: int
+    unit_cost: float
+    line_cost: float
+
+
+class SubmitRestockOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockLineItem]
+
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    submitted_date: str
+    expected_delivery: str
+    lead_time_days: int
+    total_value: float
+    budget: float
+    status: str
+    items: List[RestockLineItem]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +417,151 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """Get all user-created tasks (in-memory, non-persistent)."""
+    return user_tasks
+
+@app.post("/api/tasks", response_model=Task)
+def create_task(req: CreateTaskRequest):
+    """Create a new task. New tasks always start as 'pending'."""
+    task = {
+        "id": str(uuid.uuid4()),
+        "title": req.title,
+        "priority": req.priority,
+        "dueDate": req.dueDate,
+        "status": "pending",
+    }
+    user_tasks.append(task)
+    return task
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: str):
+    """Toggle a task's status between 'pending' and 'completed'."""
+    task = next((t for t in user_tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    """Delete a task by id."""
+    task = next((t for t in user_tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    user_tasks.remove(task)
+    return {"success": True, "id": task_id}
+
+@app.post("/api/purchase-orders", response_model=PurchaseOrder)
+def create_purchase_order(req: CreatePurchaseOrderRequest):
+    """Create a purchase order for a backlog item. Stored in-memory only.
+
+    Mutates the shared purchase_orders list so /api/backlog's has_purchase_order
+    flag immediately reflects the new PO.
+    """
+    po = {
+        "id": f"PO-{len(purchase_orders) + 1:04d}",
+        "backlog_item_id": req.backlog_item_id,
+        "supplier_name": req.supplier_name,
+        "quantity": req.quantity,
+        "unit_cost": req.unit_cost,
+        "expected_delivery_date": req.expected_delivery_date,
+        "status": "Pending",
+        "created_date": date.today().isoformat(),
+        "notes": req.notes,
+    }
+    purchase_orders.append(po)
+    return po
+
+@app.get("/api/purchase-orders/{backlog_item_id}", response_model=PurchaseOrder)
+def get_purchase_order_by_backlog_item(backlog_item_id: str):
+    """Get the purchase order associated with a given backlog item."""
+    po = next((p for p in purchase_orders if p["backlog_item_id"] == backlog_item_id), None)
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    return po
+
+@app.get("/api/restocking/recommendations", response_model=RestockRecommendationsResponse)
+def get_restock_recommendations(budget: float = 10000.0):
+    """Recommend items to restock within a budget.
+
+    Algorithm: for each demand forecast, compute demand_gap = forecasted - current,
+    sort by gap desc, then greedy-fill lines into the budget. All candidates are
+    returned with an `included` flag so the UI can grey out what didn't fit.
+    """
+    candidates = []
+    for f in demand_forecasts:
+        gap = max(0, f["forecasted_demand"] - f["current_demand"])
+        meta = _lookup_item_cost_category(f["item_sku"])
+        line_cost = round(gap * meta["unit_cost"], 2)
+        candidates.append({
+            "item_sku": f["item_sku"],
+            "item_name": f["item_name"],
+            "category": meta["category"],
+            "demand_gap": gap,
+            "recommended_quantity": gap,
+            "unit_cost": meta["unit_cost"],
+            "line_cost": line_cost,
+            "lead_time_days": CATEGORY_LEAD_TIME_DAYS.get(meta["category"], DEFAULT_LEAD_TIME_DAYS),
+            "included": False,
+        })
+
+    # Greedy fill: highest demand gap first. Zero-gap items are never included
+    # (nothing to restock) but still returned for transparency.
+    candidates.sort(key=lambda c: c["demand_gap"], reverse=True)
+    running_total = 0.0
+    for c in candidates:
+        if c["demand_gap"] > 0 and running_total + c["line_cost"] <= budget:
+            c["included"] = True
+            running_total += c["line_cost"]
+
+    return {
+        "budget": budget,
+        "total_cost": round(running_total, 2),
+        "remaining_budget": round(budget - running_total, 2),
+        "items": candidates,
+    }
+
+
+@app.post("/api/restocking/orders", response_model=RestockOrder)
+def submit_restock_order(req: SubmitRestockOrderRequest):
+    """Submit a restock order. Stored in-memory only (lost on restart)."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    total_value = round(sum(item.line_cost for item in req.items), 2)
+    if total_value > req.budget:
+        raise HTTPException(status_code=400, detail="Order total exceeds budget")
+
+    # Order-level lead time = slowest category in the order, since the whole
+    # shipment is gated on the longest-lead item.
+    lead_time = max(
+        (CATEGORY_LEAD_TIME_DAYS.get(item.category, DEFAULT_LEAD_TIME_DAYS) for item in req.items),
+        default=DEFAULT_LEAD_TIME_DAYS,
+    )
+    today = date.today()
+    order = {
+        "id": str(uuid.uuid4()),
+        "order_number": f"RST-{len(submitted_restock_orders) + 1:04d}",
+        "submitted_date": today.isoformat(),
+        "expected_delivery": (today + timedelta(days=lead_time)).isoformat(),
+        "lead_time_days": lead_time,
+        "total_value": total_value,
+        "budget": req.budget,
+        "status": "Submitted",
+        "items": [item.model_dump() for item in req.items],
+    }
+    submitted_restock_orders.append(order)
+    return order
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """List submitted restock orders, newest first."""
+    return list(reversed(submitted_restock_orders))
+
 
 if __name__ == "__main__":
     import uvicorn

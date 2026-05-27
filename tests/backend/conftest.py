@@ -1,6 +1,7 @@
 """
 Pytest configuration and fixtures for backend API tests.
 """
+import copy
 import sys
 from pathlib import Path
 
@@ -12,6 +13,35 @@ server_path = Path(__file__).parent.parent.parent / "server"
 sys.path.insert(0, str(server_path))
 
 from main import app
+import main
+
+
+# Snapshot the pristine contents of server/main.py's module-level mutable
+# stores at import time (before any test has run). The endpoints mutate these
+# lists in place (user_tasks, submitted_restock_orders, and purchase_orders
+# imported from mock_data) and nothing resets them, so without this they leak
+# state across tests.
+_PRISTINE_STATE = {
+    "user_tasks": copy.deepcopy(main.user_tasks),
+    "submitted_restock_orders": copy.deepcopy(main.submitted_restock_orders),
+    "purchase_orders": copy.deepcopy(main.purchase_orders),
+}
+
+
+@pytest.fixture(autouse=True)
+def reset_in_memory_state():
+    """Reset the in-memory stores before each test to prevent cross-test
+    contamination.
+
+    Restores via in-place slice assignment so the original list objects keep
+    their identity (purchase_orders is the same object as mock_data's, and the
+    endpoints close over these specific lists). deepcopy guards against tests
+    mutating nested dicts in any seed data.
+    """
+    main.user_tasks[:] = copy.deepcopy(_PRISTINE_STATE["user_tasks"])
+    main.submitted_restock_orders[:] = copy.deepcopy(_PRISTINE_STATE["submitted_restock_orders"])
+    main.purchase_orders[:] = copy.deepcopy(_PRISTINE_STATE["purchase_orders"])
+    yield
 
 
 @pytest.fixture

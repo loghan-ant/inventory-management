@@ -37,14 +37,27 @@ uv run python main.py
 
 # Frontend
 cd client
-npm install && npm run dev
+npm install && npm run dev   # See client/CLAUDE.md if esbuild fails (Santa/macOS)
 ```
+
+## Testing
+
+```bash
+cd tests && uv run pytest   # MUST run from tests/ (conftest.py path hack)
+```
+- Backend only — no frontend tests exist
+- Tests live in `tests/backend/`, NOT `server/`
+- Use the `backend-api-test` skill when adding tests
 
 ## Key Patterns
 
 **Filter System**: 4 filters (Time Period, Warehouse, Category, Order Status) apply to all data via query params
 **Data Flow**: Vue filters → `client/src/api.js` → FastAPI → In-memory filtering → Pydantic validation → Computed properties
 **Reactivity**: Raw data in refs (`allOrders`, `inventoryItems`), derived data in computed properties
+
+## Code Style
+- Always document non-obvious logic changes with comments
+- Python: Pydantic v2, `Optional[...]` (not `| None`)
 
 ## API Endpoints
 - `GET /api/inventory` - Filters: warehouse, category
@@ -59,6 +72,8 @@ npm install && npm run dev
 3. Update Pydantic models when changing JSON data structure
 4. Inventory filters don't support month (no time dimension)
 5. Revenue goals: $800K/month single, $9.6M YTD all months
+6. Filter value `'all'` = skip filter. Category match is case-insensitive; warehouse is case-sensitive.
+7. All endpoints are GET-only. `CreatePurchaseOrderRequest` model exists but has no endpoint (unfinished).
 
 ## File Locations
 - Views: `client/src/views/*.vue`

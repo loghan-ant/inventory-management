@@ -362,7 +362,6 @@ export default {
 }
 
 .bar-label {
-  margin-top: 0.5rem;
   font-size: 0.75rem;
   color: #64748b;
   text-align: center;

@@ -52,3 +52,6 @@ logs/
 
 # Environment variables
 .env
+
+# Machine-specific local Vite override (esbuild target workaround)
+client/vite.config.local.js

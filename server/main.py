@@ -358,16 +358,13 @@ def get_quarterly_reports(
 
     for order in filtered_orders:
         order_date = order.get('order_date', '')
-        # Determine quarter
-        if '2025-01' in order_date or '2025-02' in order_date or '2025-03' in order_date:
-            quarter = 'Q1-2025'
-        elif '2025-04' in order_date or '2025-05' in order_date or '2025-06' in order_date:
-            quarter = 'Q2-2025'
-        elif '2025-07' in order_date or '2025-08' in order_date or '2025-09' in order_date:
-            quarter = 'Q3-2025'
-        elif '2025-10' in order_date or '2025-11' in order_date or '2025-12' in order_date:
-            quarter = 'Q4-2025'
-        else:
+        # Determine the quarter from QUARTER_MAP so the year isn't hardcoded here.
+        quarter = next(
+            (q for q, q_months in QUARTER_MAP.items()
+             if any(m in order_date for m in q_months)),
+            None
+        )
+        if quarter is None:
             continue
 
         if quarter not in quarters:
